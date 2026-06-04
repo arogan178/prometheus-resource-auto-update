@@ -2,7 +2,23 @@
 
 Automates Kubernetes resource right-sizing from Prometheus/Thanos usage data, updates Kustomize service manifests, and generates pull requests natively via the Bitbucket API.
 
-For a web-friendly overview, see `docs/index.html` or publish the `docs/` directory with GitHub Pages.
+For a web-friendly overview, see `docs/index.html` or view the hosted [GitHub Pages documentation](https://arogan178.github.io/prometheus-resource-auto-update/).
+
+## Documentation
+
+The project documentation is built as a static site located in the `docs/` folder.
+
+### Deploying to GitHub Pages
+
+We have included a GitHub Actions workflow that automates deployment of the documentation to GitHub Pages on every push to the `master` branch.
+
+To set up and enable GitHub Pages for this repository:
+1. Go to your repository settings on GitHub.
+2. Select **Pages** from the sidebar.
+3. Under **Build and deployment** -> **Source**, select **GitHub Actions** from the dropdown menu.
+4. The workflow will automatically run on your next push, or you can trigger it manually under the **Actions** tab of the repository.
+
+To view the documentation offline/locally, simply open `docs/index.html` in your web browser.
 
 ## Core Features
 
