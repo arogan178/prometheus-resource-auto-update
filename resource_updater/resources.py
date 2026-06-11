@@ -1,6 +1,7 @@
 import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional, Tuple
-from goldilocks.config import (
+from resource_updater.config import (
     CPU_REQUEST_TARGET_FACTOR,
     MEMORY_REQUEST_TARGET_FACTOR,
     CPU_LIMIT_BUFFER_FACTOR,
@@ -102,7 +103,10 @@ def cpu_to_millis(v: str) -> Optional[int]:
     if not v:
         return None
     if v.endswith("m"):
-        return int(v[:-1])
+        try:
+            return int(Decimal(v[:-1]).to_integral_value(rounding=ROUND_HALF_UP))
+        except (InvalidOperation, ValueError):
+            return None
     try:
         return int(float(v) * 1000 + 0.5)
     except ValueError:

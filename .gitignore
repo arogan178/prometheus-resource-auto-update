@@ -64,3 +64,4 @@ resource_reverts_*.txt
 resource_changes_*.txt
 resource_reverts_*.md
 resource_changes_*.md
+resource_update_reports/

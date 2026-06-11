@@ -3,14 +3,14 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Set
 
-from goldilocks.config import (
+from resource_updater.config import (
     REPOS_DIR,
     CLUSTER_CONFIG,
     KUSTOMIZE_REPOS_DIR,
     KUSTOMIZE_MONOREPO_NAME,
 )
-from goldilocks.k8s import get_cluster
-from goldilocks.utils import run_cmd
+from resource_updater.k8s import get_cluster
+from resource_updater.utils import run_cmd
 
 PREFIX_KEY = "__prefix__:"
 WORKLOAD_KINDS = {"Deployment", "StatefulSet", "CronJob", "Job"}
@@ -433,6 +433,10 @@ def find_resource_patch_file(
     # First, collect all candidate patch files referenced in kustomization.yaml
     candidate_patches = []
 
+    def add_candidate(path: Path) -> None:
+        if path not in candidate_patches:
+            candidate_patches.append(path)
+
     kustomization = env_dir / "kustomization.yaml"
     if kustomization.exists():
         content = kustomization.read_text()
@@ -452,7 +456,7 @@ def find_resource_patch_file(
                 in_section = False
             if in_section and line.strip().startswith("-"):
                 val = line.strip()[1:].strip().strip("'\"")
-                candidate_patches.append(env_dir / val)
+                add_candidate(env_dir / val)
 
         # Check patches: - path: syntax
         in_patches_section = False
@@ -470,20 +474,45 @@ def find_resource_patch_file(
                 in_patches_section = False
             if in_patches_section and stripped.startswith("- path:"):
                 val = stripped.split("- path:")[1].strip().strip("'\"")
-                candidate_patches.append(env_dir / val)
+                add_candidate(env_dir / val)
+            elif in_patches_section and stripped.startswith("path:"):
+                val = stripped.split("path:", 1)[1].strip().strip("'\"")
+                add_candidate(env_dir / val)
 
-    # Also always check limits-patch.yaml as a fallback candidate
-    limits_patch = env_dir / "limits-patch.yaml"
-    if limits_patch.exists() and limits_patch not in candidate_patches:
-        candidate_patches.append(limits_patch)
+    # Also check common resource patch filenames as fallback candidates. Some
+    # repos keep these files in predictable names while the kustomization uses a
+    # shape that this lightweight parser cannot fully interpret.
+    for fallback_name in (
+        "limits-patch.yaml",
+        "resource-limits.yaml",
+        "deployment-patch.yaml",
+        "deployment-patches.yaml",
+    ):
+        fallback_patch = env_dir / fallback_name
+        if fallback_patch.exists():
+            add_candidate(fallback_patch)
+
+    resource_patch_candidates: List[Tuple[Path, str]] = []
 
     for candidate in candidate_patches:
         if not candidate.exists():
             continue
 
-        if target_deployment:
-            # If target provided, ensure the patch file name or its content targets the deployment
-            content = candidate.read_text()
+        content = candidate.read_text()
+        has_resource_block = (
+            re.search(r"(?m)^\s*requests:\s*$", content) is not None
+            and re.search(r"(?m)^\s*limits:\s*$", content) is not None
+            and re.search(r"(?m)^\s*cpu:\s*.+$", content) is not None
+            and re.search(r"(?m)^\s*memory:\s*.+$", content) is not None
+        )
+        if not has_resource_block:
+            continue
+
+        resource_patch_candidates.append((candidate, content))
+
+    if target_deployment:
+        for candidate, content in resource_patch_candidates:
+            # If target provided, ensure the patch file name or its content targets the deployment.
             if re.search(
                 rf"name:\s*['\"]?{re.escape(target_deployment)}['\"]?(?:\s|$)", content
             ):
@@ -495,21 +524,21 @@ def find_resource_patch_file(
                 rf"name:\s*['\"]?{re.escape(target_base)}['\"]?(?:\s|$)", content
             ) or re.search(rf"\b{re.escape(target_base)}\b", candidate.name):
                 return candidate
-        else:
-            # Legacy behavior for data repos: return first valid patch file
-            val = candidate.name
-            if val in [
-                "limits-patch.yaml",
-                "deployment-patch.yaml",
-                "resource-limits.yaml",
-            ]:
+
+        return None
+
+    for preferred_name in (
+        "limits-patch.yaml",
+        "resource-limits.yaml",
+        "deployment-patch.yaml",
+        "deployment-patches.yaml",
+    ):
+        for candidate, _content in resource_patch_candidates:
+            if candidate.name == preferred_name:
                 return candidate
-            if re.search(
-                r"^kind:\s+(Deployment|StatefulSet|CronJob|Job)$",
-                candidate.read_text(),
-                re.MULTILINE,
-            ):
-                return candidate
+
+    if resource_patch_candidates:
+        return resource_patch_candidates[0][0]
 
     return None
 

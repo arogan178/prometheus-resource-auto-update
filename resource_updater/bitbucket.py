@@ -8,9 +8,9 @@ import urllib.parse
 import urllib.request
 from typing import Optional, Tuple
 
-from goldilocks.models import BitbucketAuth
-from goldilocks.utils import log_warn
-from goldilocks.config import WORKSPACE
+from resource_updater.models import BitbucketAuth
+from resource_updater.utils import log_warn
+from resource_updater.config import WORKSPACE
 
 
 def get_bitbucket_auth() -> Optional[BitbucketAuth]:

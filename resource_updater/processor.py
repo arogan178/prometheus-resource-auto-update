@@ -5,8 +5,8 @@ import concurrent.futures
 from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 
-from goldilocks.models import Recommendation, PRData
-from goldilocks.config import (
+from resource_updater.models import Recommendation, PRData, SkippedRecommendation
+from resource_updater.config import (
     BRANCH,
     UPDATE_COMMIT_MSG,
     REVERT_COMMIT_MSG,
@@ -14,7 +14,7 @@ from goldilocks.config import (
     PROMETHEUS_PERCENTILE,
     DEBUG,
 )
-from goldilocks.utils import (
+from resource_updater.utils import (
     log_warn,
     run_cmd,
     read_single_key,
@@ -27,7 +27,7 @@ from goldilocks.utils import (
     BOLD,
     NC,
 )
-from goldilocks.resources import (
+from resource_updater.resources import (
     get_auto_merge_thresholds,
     get_limit_buffer_policy,
     get_request_tightening_policy,
@@ -37,21 +37,21 @@ from goldilocks.resources import (
     format_val,
     format_diff_detailed,
 )
-from goldilocks.git import (
+from resource_updater.git import (
     get_repo,
     commit_push,
     find_resource_update_restore_source,
     describe_commit,
 )
-from goldilocks.kustomize import (
+from resource_updater.kustomize import (
     update_limits,
     find_repo_env_dir,
     find_limits_file_for_deployment,
     find_resource_patch_file,
     read_limits_file,
 )
-from goldilocks.k8s import get_cluster
-from goldilocks.bitbucket import (
+from resource_updater.k8s import get_cluster
+from resource_updater.bitbucket import (
     create_pull_request,
     merge_pull_request,
     decline_pull_request,
@@ -65,6 +65,7 @@ def generate_markdown_report(
     applied_recs: List[Recommendation],
     prometheus_days: str,
     prometheus_percentile: str,
+    skipped_recs: Optional[List[SkippedRecommendation]] = None,
 ):
     cpu_factor, mem_factor = get_request_tightening_policy()
     cpu_limit_factor, mem_limit_factor = get_limit_buffer_policy()
@@ -72,6 +73,10 @@ def generate_markdown_report(
     mem_pct = int(mem_factor * 100)
     cpu_lim_pct = int(cpu_limit_factor * 100)
     mem_lim_pct = int(mem_limit_factor * 100)
+    skipped_recs = skipped_recs or []
+
+    def md_cell(value: str) -> str:
+        return str(value).replace("|", "\\|").replace("\n", "<br>")
 
     def get_req_label(pct):
         if pct < 100:
@@ -86,11 +91,12 @@ def generate_markdown_report(
 
     with output_file.open("w", encoding="utf-8") as f:
         f.write(f"# {title}\n")
-        f.write(f"**Environment:** {env.upper()}\n")
-        f.write(f"**Prometheus lookback:** {prometheus_days}d\n")
         f.write(
-            f"**Generated:** {len(applied_recs)} deployments across {len(set(r.namespace for r in applied_recs))} namespace(s)\n\n"
+            f"**Generated:** {len(applied_recs)} patchable deployment(s) across {len(set(r.namespace for r in applied_recs))} namespace(s)"
         )
+        if skipped_recs:
+            f.write(f"; {len(skipped_recs)} skipped/unpatchable recommendation(s)")
+        f.write("\n\n")
 
         deployment_records = []
         ns_stats = {}
@@ -166,23 +172,51 @@ def generate_markdown_report(
             total_cur_limit_mem += lm_cur
             total_tgt_limit_mem += lm_tgt
 
-        f.write("## 🌍 Cluster-Wide Totals\n")
+        def diff_text(current: int, target: int, unit: str) -> str:
+            return format_diff_detailed(current, target, unit).split(" ", 3)[-1]
+
+        def change_text(current: int, target: int, unit: str) -> str:
+            return (
+                f"{format_val(current, unit)} -> {format_val(target, unit)} "
+                f"{diff_text(current, target, unit)}"
+            )
+
+        def cell(current: int, target: int, unit: str) -> str:
+            return f"{format_val(current, unit)} -> {format_val(target, unit)}"
+
+        def note_lines(rec: Recommendation) -> List[str]:
+            notes = []
+            if rec.baseline_summary:
+                notes.append(rec.baseline_summary)
+            if rec.cpu_request_reason:
+                notes.append(f"CPU request: {rec.cpu_request_reason}")
+            if rec.cpu_limit_reason:
+                notes.append(f"CPU limit: {rec.cpu_limit_reason}")
+            if rec.mem_request_reason:
+                notes.append(f"Memory request: {rec.mem_request_reason}")
+            if rec.mem_limit_reason:
+                notes.append(f"Memory limit: {rec.mem_limit_reason}")
+            return notes
+
+        prom_pct_display = int(float(prometheus_percentile) * 100)
+
+        f.write("## Totals (All Namespaces in this Environment)\n")
         f.write("| Resource | Current | Target | Difference |\n")
         f.write("|---|---|---|---|\n")
         f.write(
-            f"| **CPU Requests** | {format_val(total_cur_cpu, 'm')} | {format_val(total_tgt_cpu, 'm')} | {format_diff_detailed(total_cur_cpu, total_tgt_cpu, 'm').split(' ', 3)[-1]} |\n"
+            f"| CPU Requests | {format_val(total_cur_cpu, 'm')} | {format_val(total_tgt_cpu, 'm')} | {diff_text(total_cur_cpu, total_tgt_cpu, 'm')} |\n"
         )
         f.write(
-            f"| **Mem Requests** | {format_val(total_cur_mem, 'Mi')} | {format_val(total_tgt_mem, 'Mi')} | {format_diff_detailed(total_cur_mem, total_tgt_mem, 'Mi').split(' ', 3)[-1]} |\n"
+            f"| Mem Requests | {format_val(total_cur_mem, 'Mi')} | {format_val(total_tgt_mem, 'Mi')} | {diff_text(total_cur_mem, total_tgt_mem, 'Mi')} |\n"
         )
         f.write(
-            f"| **CPU Limits** | {format_val(total_cur_limit_cpu, 'm')} | {format_val(total_tgt_limit_cpu, 'm')} | {format_diff_detailed(total_cur_limit_cpu, total_tgt_limit_cpu, 'm').split(' ', 3)[-1]} |\n"
+            f"| CPU Limits | {format_val(total_cur_limit_cpu, 'm')} | {format_val(total_tgt_limit_cpu, 'm')} | {diff_text(total_cur_limit_cpu, total_tgt_limit_cpu, 'm')} |\n"
         )
         f.write(
-            f"| **Mem Limits** | {format_val(total_cur_limit_mem, 'Mi')} | {format_val(total_tgt_limit_mem, 'Mi')} | {format_diff_detailed(total_cur_limit_mem, total_tgt_limit_mem, 'Mi').split(' ', 3)[-1]} |\n\n"
+            f"| Mem Limits | {format_val(total_cur_limit_mem, 'Mi')} | {format_val(total_tgt_limit_mem, 'Mi')} | {diff_text(total_cur_limit_mem, total_tgt_limit_mem, 'Mi')} |\n\n"
         )
 
-        f.write("## 🏢 Resource Impact Per Namespace\n")
+        f.write("## Namespace Impact\n")
         sorted_ns = sorted(
             ns_stats.items(),
             key=lambda x: (
@@ -196,25 +230,29 @@ def generate_markdown_report(
             ),
             reverse=True,
         )
+        f.write("| Namespace | Deployments | CPU Req | Mem Req | CPU Limit | Mem Limit |\n")
+        f.write("|---|---:|---|---|---|---|\n")
         for ns, stats in sorted_ns:
-            f.write(f"### `{ns}` ({stats['count']} deployments)\n")
-            f.write("| Resource | Current | Target | Difference |\n")
-            f.write("|---|---|---|---|\n")
             f.write(
-                f"| **CPU Requests** | {format_val(stats['cur_cpu'], 'm')} | {format_val(stats['tgt_cpu'], 'm')} | {format_diff_detailed(stats['cur_cpu'], stats['tgt_cpu'], 'm').split(' ', 3)[-1]} |\n"
+                f"| `{md_cell(ns)}` | {stats['count']} | "
+                f"{change_text(stats['cur_cpu'], stats['tgt_cpu'], 'm')} | "
+                f"{change_text(stats['cur_mem'], stats['tgt_mem'], 'Mi')} | "
+                f"{change_text(stats['cur_limit_cpu'], stats['tgt_limit_cpu'], 'm')} | "
+                f"{change_text(stats['cur_limit_mem'], stats['tgt_limit_mem'], 'Mi')} |\n"
             )
-            f.write(
-                f"| **Mem Requests** | {format_val(stats['cur_mem'], 'Mi')} | {format_val(stats['tgt_mem'], 'Mi')} | {format_diff_detailed(stats['cur_mem'], stats['tgt_mem'], 'Mi').split(' ', 3)[-1]} |\n"
-            )
-            f.write(
-                f"| **CPU Limits** | {format_val(stats['cur_limit_cpu'], 'm')} | {format_val(stats['tgt_limit_cpu'], 'm')} | {format_diff_detailed(stats['cur_limit_cpu'], stats['tgt_limit_cpu'], 'm').split(' ', 3)[-1]} |\n"
-            )
-            f.write(
-                f"| **Mem Limits** | {format_val(stats['cur_limit_mem'], 'Mi')} | {format_val(stats['tgt_limit_mem'], 'Mi')} | {format_diff_detailed(stats['cur_limit_mem'], stats['tgt_limit_mem'], 'Mi').split(' ', 3)[-1]} |\n\n"
-            )
+        f.write("\n")
 
         deployment_records.sort(key=lambda x: x[0], reverse=True)
-        f.write("## 🚀 Per-Deployment Changes (Sorted by Impact)\n\n")
+        f.write("## Patchable Changes\n\n")
+        f.write(
+            "Sorted by total absolute CPU and memory movement. "
+            f"Request policy: CPU {cpu_req_label}, memory {mem_req_label}; "
+            f"limit buffers: CPU {cpu_lim_pct}%, memory {mem_lim_pct}%.\n\n"
+        )
+        f.write(
+            "| Namespace | Deployment | Action | CPU Req | Mem Req | CPU Limit | Mem Limit |\n"
+        )
+        f.write("|---|---|---|---|---|---|---|\n")
         for (
             _impact,
             rec,
@@ -227,51 +265,68 @@ def generate_markdown_report(
             lm_cur,
             lm_tgt,
         ) in deployment_records:
-            f.write(f"### `{rec.namespace} / {rec.deployment}`\n")
-            f.write("| Metric | Current | Target | Difference | Source |\n")
-            f.write("|---|---|---|---|---|\n")
-
-            cpu_req_diff = format_diff_detailed(c_cur, c_tgt, "m").split(" ", 3)[-1]
-            mem_req_diff = format_diff_detailed(m_cur, m_tgt, "Mi").split(" ", 3)[-1]
-            cpu_lim_diff = format_diff_detailed(lc_cur, lc_tgt, "m").split(" ", 3)[-1]
-            mem_lim_diff = format_diff_detailed(lm_cur, lm_tgt, "Mi").split(" ", 3)[-1]
-
-            if rec.prom_cpu_p95:
-                prom_pct_display = int(float(prometheus_percentile) * 100)
-                cpu_source = (
-                    f"Prometheus 30d P{prom_pct_display}: `{rec.prom_cpu_p95}` cores"
-                )
-            else:
-                cpu_source = "N/A"
-
-            if rec.prom_mem_p95:
-                prom_pct_display = int(float(prometheus_percentile) * 100)
-                mem_source = f"Prometheus 30d P{prom_pct_display}: `{rec.prom_mem_p95}`"
-            else:
-                mem_source = "N/A"
-
-            cpu_upper_src = (
-                f"Prometheus 30d Limit (P99): `{rec.prom_cpu_p99}`"
-                if rec.prom_cpu_p99
-                else "N/A"
-            )
-            mem_upper_src = (
-                f"Prometheus 30d Limit (P99): `{rec.prom_mem_p99}`"
-                if rec.prom_mem_p99
-                else "N/A"
-            )
-
             f.write(
-                f"| **CPU Request** | {format_val(c_cur, 'm')} | **{format_val(c_tgt, 'm')}**<br>*({cpu_req_label})* | {cpu_req_diff} | {cpu_source} |\n"
+                f"| `{md_cell(rec.namespace)}` | `{md_cell(rec.deployment)}` | "
+                f"{md_cell(rec.sizing_action or 'change')} | "
+                f"{cell(c_cur, c_tgt, 'm')} | "
+                f"{cell(m_cur, m_tgt, 'Mi')} | "
+                f"{cell(lc_cur, lc_tgt, 'm')} | "
+                f"{cell(lm_cur, lm_tgt, 'Mi')} |\n"
+            )
+        f.write("\n")
+
+        f.write("## Decision Details\n\n")
+        f.write(
+            f"<details>\n<summary>Prometheus signals and policy reasons "
+            f"({len(deployment_records)} deployment(s))</summary>\n\n"
+        )
+        for (
+            _impact,
+            rec,
+            *_values,
+        ) in deployment_records:
+            f.write(f"**`{rec.namespace} / {rec.deployment}`**\n\n")
+            f.write(
+                f"- Prometheus {prometheus_days}d P{prom_pct_display}: "
+                f"CPU `{rec.prom_cpu_p95 or 'n/a'}`, memory `{rec.prom_mem_p95 or 'n/a'}`\n"
             )
             f.write(
-                f"| **Mem Request** | {format_val(m_cur, 'Mi')} | **{format_val(m_tgt, 'Mi')}**<br>*({mem_req_label})* | {mem_req_diff} | {mem_source} |\n"
+                f"- Prometheus {prometheus_days}d limit pctl: "
+                f"CPU `{rec.prom_cpu_p99 or 'n/a'}`, memory `{rec.prom_mem_p99 or 'n/a'}`\n"
             )
+            for note in note_lines(rec):
+                f.write(f"- {note}\n")
+            f.write("\n")
+        f.write("</details>\n\n")
+
+        f.write("## Skipped / Unpatchable Recommendations\n\n")
+        if not skipped_recs:
+            f.write("No recommendations were skipped during dry-run validation.\n")
+            return
+
+        category_counts: Dict[str, int] = {}
+        for skipped in skipped_recs:
+            category_counts[skipped.category] = category_counts.get(skipped.category, 0) + 1
+
+        f.write("| Category | Count |\n")
+        f.write("|---|---:|\n")
+        for category, count in sorted(category_counts.items()):
+            f.write(f"| {md_cell(category)} | {count} |\n")
+
+        f.write("\n| Namespace | Deployment | Repo | Category | Reason |\n")
+        f.write("|---|---|---|---|---|\n")
+        for skipped in sorted(
+            skipped_recs,
+            key=lambda item: (
+                item.category,
+                item.namespace,
+                item.deployment,
+                item.repo,
+            ),
+        ):
             f.write(
-                f"| **CPU Limit** | {format_val(lc_cur, 'm')} | **{format_val(lc_tgt, 'm')}**<br>*(Buffered {cpu_lim_pct}%)* | {cpu_lim_diff} | {cpu_upper_src} |\n"
-            )
-            f.write(
-                f"| **Mem Limit** | {format_val(lm_cur, 'Mi')} | **{format_val(lm_tgt, 'Mi')}**<br>*(Buffered {mem_lim_pct}%)* | {mem_lim_diff} | {mem_upper_src} |\n\n"
+                f"| `{md_cell(skipped.namespace)}` | `{md_cell(skipped.deployment)}` | "
+                f"`{md_cell(skipped.repo)}` | {md_cell(skipped.category)} | {md_cell(skipped.reason)} |\n"
             )
 
 
@@ -512,7 +567,7 @@ def process_revert_single_repo(
                 continue
             if restore_source is None or restore_display is None:
                 logs.append(
-                    f"  {YELLOW}[WARN]{NC} Could not determine a pre-optimization restore point for {relative_path}."
+                    f"  {YELLOW}[WARN]{NC} Could not determine a pre-update restore point for {relative_path}."
                 )
                 continue
 
@@ -609,7 +664,7 @@ def process_revert_single_repo(
                 )
             )
             logs.append(
-                f"  [INFO] Dry run: Would restore {env.upper()} resources using pre-optimization commit(s): {restore_points}."
+                f"  [INFO] Dry run: Would restore {env.upper()} resources using pre-update commit(s): {restore_points}."
             )
             return logs, 1, 0, None, applied_recs
 
@@ -638,7 +693,7 @@ def process_revert_single_repo(
                 base_branch,
                 work_branch,
                 title=revert_msg,
-                desc=f"Reverting previous Prometheus resource updates for {env.upper()}. Restoring state from pre-optimization commit(s): {restore_points}.",
+                desc=f"Reverting previous Prometheus resource updates for {env.upper()}. Restoring state from pre-update commit(s): {restore_points}.",
             )
             if pr_info:
                 pr_id, pr_url = pr_info
@@ -676,8 +731,8 @@ def process_revert_single_repo(
 
 
 def process_bulk_prs(action_name: str, pr_list: List[PRData], task_function):
-    from goldilocks.config import WAIT_FOR_ROLLOUT
-    from goldilocks.k8s import wait_for_rollouts
+    from resource_updater.config import WAIT_FOR_ROLLOUT
+    from resource_updater.k8s import wait_for_rollouts
 
     is_merge = task_function.__name__ == "merge_pull_request"
 
@@ -759,8 +814,8 @@ def review_and_merge_prs(prs: List[PRData]):
         )
 
         if choice == "y":
-            from goldilocks.config import WAIT_FOR_ROLLOUT
-            from goldilocks.k8s import wait_for_rollouts
+            from resource_updater.config import WAIT_FOR_ROLLOUT
+            from resource_updater.k8s import wait_for_rollouts
 
             print(f"\nMerging {pr.repo}...")
             try:

@@ -13,6 +13,7 @@ The project documentation is built as a static site located in the `docs/` folde
 We have included a GitHub Actions workflow that automates deployment of the documentation to GitHub Pages on every push to the `master` branch.
 
 To set up and enable GitHub Pages for this repository:
+
 1. Go to your repository settings on GitHub.
 2. Select **Pages** from the sidebar.
 3. Under **Build and deployment** -> **Source**, select **GitHub Actions** from the dropdown menu.
@@ -25,7 +26,7 @@ To view the documentation offline/locally, simply open `docs/index.html` in your
 - **Automated Resource Tuning:** Applies Prometheus-based CPU and memory recommendations to `limits-patch.yaml` or relevant resource files across multiple repositories simultaneously.
 - **Prometheus Integration:** Queries Prometheus/Thanos for usage percentiles and derives request/limit targets without relying on namespace labels or external recommender objects.
 - **Interactive Review:** Provides an interactive CLI to review and approve changes before merging, with auto-merge capabilities for safe, below-threshold updates.
-- **Revert Mode:** Rolls back recent automated optimizations to a previous stable state by detecting earlier resource-update commits and checking out pre-optimization file versions.
+- **Revert Mode:** Rolls back recent automated optimizations to a previous stable state by detecting earlier resource-update commits and checking out pre-update file versions.
 
 ## Prerequisites
 
@@ -56,7 +57,7 @@ RESOURCE_UPDATE_BRANCH=resource-update
 **Local repo paths** — update these to match where you have cloned the target repositories. `KUSTOMIZE_REPOS_DIR` can point either to one mono repo or to a parent directory containing many kustomize repos.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `KUSTOMIZE_REPOS_DIR` | `/path/to/kustomize-repos` | A single kustomize repo root, or a directory containing multiple kustomize repo checkouts |
 | `KUSTOMIZE_MONOREPO_NAME` | basename of `KUSTOMIZE_REPOS_DIR` | Repo slug/name to use when `KUSTOMIZE_REPOS_DIR` points at one mono repo |
 | `CLUSTER_CONFIG` | `/path/to/cluster-config-repo` | Cluster config repo |
@@ -64,7 +65,7 @@ RESOURCE_UPDATE_BRANCH=resource-update
 **Cluster & Namespace Mapping:**
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `CLUSTER_MAPPING` | `{}` | JSON map of env abbreviation to cluster name (e.g. `{"dev": "cluster-1"}`) |
 | `NAMESPACE_INCLUDE_REGEX` | *(empty)* | Optional regex for filtering namespaces; empty scans every accessible namespace |
 | `CLUSTER_CONFIG_APPS_TEMPLATE` | `namespaces/{cluster}/{namespace}/applications/kustomization.yaml` | Optional template for discovering app repos from a cluster-config checkout |
@@ -75,7 +76,7 @@ RESOURCE_UPDATE_BRANCH=resource-update
 **Thresholds and Tuning Factors:**
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `AUTO_MERGE_CPU_THRESHOLD` | `1` | CPU target above which PRs require manual review |
 | `AUTO_MERGE_MEMORY_THRESHOLD` | `4Gi` | Memory target above which PRs require manual review |
 | `CPU_REQUEST_TARGET_FACTOR` | `0.95` | Multiplier applied to base CPU targets to set requests |
@@ -96,7 +97,7 @@ RESOURCE_UPDATE_BRANCH=resource-update
 **Prometheus Settings:**
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `PROMETHEUS_URL` | *(auto)* | Prometheus/Thanos URL (auto-detected via `kubectl get route` if empty) |
 | `PROMETHEUS_TOKEN` | *(auto)* | Bearer token (auto-detected via `oc whoami -t` if empty) |
 | `PROMETHEUS_DAYS` | `30` | Lookback period for metric queries |
@@ -115,12 +116,13 @@ The interactive wizard will guide you through the process:
 
 1. **Authentication:** Validates Bitbucket credentials from `.env` or prompts for them.
 2. **Cluster Check:** Verifies you are authenticated to the cluster.
-3. **Environment:** Enter the target environment or cluster alias (e.g., `dev`, `stg`, `prd`).
-4. **Namespace Selection:** Select specific namespaces or process all discovered namespaces.
-5. **Operation Mode:**
+3. **Dry-run Extraction:** Optionally infer environments from namespace suffixes and generate report files only. Namespaces ending in `-dev01` produce a `dev` report; namespaces ending in `-uat01`, `-stg01`, and `-prd01` produce separate CPE-style reports.
+4. **Environment:** For the standard flow, enter the target environment or cluster alias (e.g., `dev`, `stg`, `prd`).
+5. **Namespace Selection:** Select specific namespaces or process all discovered namespaces.
+6. **Operation Mode:**
    - **[u] Update:** Fetch metrics and apply optimizations.
    - **[v] Revert:** Roll back the last optimization batch.
-6. **PR Action:**
+7. **PR Action:**
    - **[r] Review:** Interactively review PRs with diffs, merge, decline, or auto-merge safe ones.
    - **[l] Leave open:** Create PRs but do not review them.
    - **[f] Dry run:** Do not modify files or create PRs; only generate a detailed Markdown report.
@@ -160,3 +162,19 @@ In addition to interacting with Bitbucket, the script provides detailed console 
 - `resource_reverts_<env>_<date>.md`
 
 These reports include aggregated cluster-wide savings and a detailed breakdown of per-deployment impact, sorting the most significant resource shifts to the top.
+
+Multi-environment dry-run extraction writes one report per inferred environment under a timestamped run directory:
+
+```text
+resource_update_reports/index.html          # bookmark/share this entry point
+resource_update_reports/<date_time>/index.html
+resource_update_reports/<date_time>/
+  resource_changes_uat.md
+  resource_changes_uat.html
+  resource_changes_stg.md
+  resource_changes_stg.html
+  resource_changes_prd.md
+  resource_changes_prd.html
+```
+
+Each environment also gets a self-contained HTML dashboard with sortable tables and navigation back to the run and report home indexes.
