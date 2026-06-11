@@ -1,3 +1,4 @@
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,15 @@ from resource_updater.html_report import (
     generate_report_history_index,
     generate_report_index,
 )
+
+
+def load_auto_update_module():
+    script_path = Path(__file__).resolve().parents[1] / "auto-update.py"
+    spec = importlib.util.spec_from_file_location("auto_update_for_test", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 class DryRunReportingTests(unittest.TestCase):
@@ -133,6 +143,71 @@ class DryRunReportingTests(unittest.TestCase):
         self.assertIn("## Skipped / Unpatchable Recommendations", report)
         self.assertIn("workload-b", report)
         self.assertIn("Missing kustomize patch", report)
+
+    def test_execute_update_writes_html_and_skipped_report_without_internal_names(
+        self,
+    ) -> None:
+        auto_update = load_auto_update_module()
+        mapped = Recommendation(
+            namespace="app-stg01",
+            deployment="workload-a",
+            cpu_cur="100m",
+            cpu_tgt="150m",
+            mem_cur="128Mi",
+            mem_tgt="256Mi",
+            cpu_limit_cur="200m",
+            mem_limit_cur="256Mi",
+            cpu_limit_tgt="300m",
+            mem_limit_tgt="512Mi",
+            prom_cpu_p95="0.12",
+            prom_mem_p95="160Mi",
+        )
+        unmapped = Recommendation(
+            namespace="app-stg01",
+            deployment="workload-b",
+            cpu_cur="100m",
+            cpu_tgt="100m",
+            mem_cur="128Mi",
+            mem_tgt="128Mi",
+            cpu_limit_cur="200m",
+            mem_limit_cur="256Mi",
+            cpu_limit_tgt="200m",
+            mem_limit_tgt="256Mi",
+        )
+
+        def fake_process_single_repo(repo, repo_recs, env, pr_action):
+            self.assertEqual(repo, "sample-app")
+            self.assertEqual(env, "stg")
+            self.assertEqual(pr_action, "f")
+            return ["processed sample-app"], 0, 0, None, repo_recs
+
+        auto_update.get_prom_recommendations = lambda _ns: [mapped, unmapped]
+        auto_update.build_ns_repo_map = lambda _env, _namespaces: {
+            "app-stg01": {"workload-a": "sample-app"}
+        }
+        auto_update.process_single_repo = fake_process_single_repo
+        auto_update.print_statistics = lambda _recs: None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir)
+            result = auto_update.execute_update(
+                "stg", ["app-stg01"], "f", report_dir=report_dir
+            )
+            markdown = result.output_file.read_text()
+            html = result.html_output_file.read_text()
+
+        self.assertEqual(result.applied_count, 1)
+        self.assertEqual(result.skipped_count, 1)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(result.output_file.name, "resource_changes_stg.md")
+        self.assertEqual(result.html_output_file.name, "resource_changes_stg.html")
+        self.assertIn("Skipped / Unpatchable Recommendations", markdown)
+        self.assertIn("workload-b", markdown)
+        self.assertIn("Repo mapping", html)
+        for content in (markdown, html):
+            self.assertNotIn("_both", content)
+            self.assertNotIn("logic-", content)
+            self.assertNotIn("gaminginnovationgroup", content.lower())
 
     def test_html_report_generates_self_contained_dashboard(self) -> None:
         rec = Recommendation(
