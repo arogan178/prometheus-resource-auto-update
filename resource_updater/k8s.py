@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional, List, Dict, Tuple
 
-from goldilocks.config import (
+from resource_updater.config import (
     PROMETHEUS_URL,
     PROMETHEUS_TOKEN,
     PROMETHEUS_VERIFY_SSL,
@@ -20,8 +20,8 @@ from goldilocks.config import (
     MIN_CPU_DIFF_MILLIS,
     MIN_MEM_DIFF_MI,
 )
-from goldilocks.models import Recommendation
-from goldilocks.resources import (
+from resource_updater.models import Recommendation
+from resource_updater.resources import (
     get_request_tightening_policy,
     get_limit_buffer_policy,
     get_bulk_retain_policy,
@@ -41,7 +41,7 @@ from goldilocks.resources import (
     retained_cpu_millis,
     retained_memory_mi,
 )
-from goldilocks.utils import run_cmd, log, log_warn
+from resource_updater.utils import run_cmd, log, log_warn
 
 _prom_url_cache = None
 _prom_token_cache = None
@@ -63,6 +63,16 @@ def get_namespaces() -> List[str]:
     if res.returncode != 0:
         return []
     return res.stdout.strip().split()
+
+
+def _load_json_output(args: List[str]) -> Optional[Dict]:
+    res = run_cmd(args)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        return json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
 
 
 def get_prometheus_url(ns: str) -> Optional[str]:
@@ -149,38 +159,86 @@ def query_prometheus(prom_url: str, token: str, query: str) -> Optional[list]:
             return None
 
 
+def _pod_workload_map(ns: str) -> Dict[str, str]:
+    data = _load_json_output(["oc", "get", "pods,replicasets", "-n", ns, "-o", "json"])
+    if not data:
+        return {}
+
+    replica_set_workloads: Dict[str, str] = {}
+    pod_workloads: Dict[str, str] = {}
+
+    for item in data.get("items", []) or []:
+        if item.get("kind") != "ReplicaSet":
+            continue
+        rs_name = item.get("metadata", {}).get("name")
+        if not rs_name:
+            continue
+        owner = next(
+            (
+                ref
+                for ref in item.get("metadata", {}).get("ownerReferences", []) or []
+                if ref.get("kind") == "Deployment" and ref.get("name")
+            ),
+            None,
+        )
+        if owner:
+            replica_set_workloads[rs_name] = owner["name"]
+
+    for item in data.get("items", []) or []:
+        if item.get("kind") != "Pod":
+            continue
+        pod_name = item.get("metadata", {}).get("name")
+        if not pod_name:
+            continue
+        owner_refs = item.get("metadata", {}).get("ownerReferences", []) or []
+        owner = owner_refs[0] if owner_refs else {}
+        owner_kind = owner.get("kind")
+        owner_name = owner.get("name")
+
+        if owner_kind == "ReplicaSet" and owner_name in replica_set_workloads:
+            pod_workloads[pod_name] = replica_set_workloads[owner_name]
+        elif owner_kind in {"Deployment", "StatefulSet"} and owner_name:
+            pod_workloads[pod_name] = owner_name
+
+    return pod_workloads
+
+
 def get_prometheus_resource_data(
-    ns: str, prom_url: str, token: str
-) -> Dict[str, Dict[str, float]]:
+    ns: str,
+    prom_url: str,
+    token: str,
+    pod_workloads: Optional[Dict[str, str]] = None,
+) -> Dict[Tuple[str, str], Dict[str, float]]:
     days = PROMETHEUS_DAYS
     pct = PROMETHEUS_PERCENTILE
     lim_pct = PROMETHEUS_LIMIT_PERCENTILE
+    pod_workloads = pod_workloads if pod_workloads is not None else _pod_workload_map(ns)
 
     # Requests: P95
     cpu_req_query = (
-        f"max by (container) ("
+        f"max by (pod, container) ("
         f"  quantile_over_time({pct}, rate(container_cpu_usage_seconds_total{{"
-        f'    namespace="{ns}", container!="", container!="POD"'
+        f'    namespace="{ns}", pod!="", container!="", container!="POD"'
         f"}}[5m])[{days}d:1h]))"
     )
     mem_req_query = (
-        f"max by (container) ("
+        f"max by (pod, container) ("
         f"  quantile_over_time({pct}, container_memory_working_set_bytes{{"
-        f'    namespace="{ns}", container!="", container!="POD"'
+        f'    namespace="{ns}", pod!="", container!="", container!="POD"'
         f"}}[{days}d:1h])) / 1048576"
     )
 
     # Limits: P99
     cpu_lim_query = (
-        f"max by (container) ("
+        f"max by (pod, container) ("
         f"  quantile_over_time({lim_pct}, rate(container_cpu_usage_seconds_total{{"
-        f'    namespace="{ns}", container!="", container!="POD"'
+        f'    namespace="{ns}", pod!="", container!="", container!="POD"'
         f"}}[5m])[{days}d:1h]))"
     )
     mem_lim_query = (
-        f"max by (container) ("
+        f"max by (pod, container) ("
         f"  quantile_over_time({lim_pct}, container_memory_working_set_bytes{{"
-        f'    namespace="{ns}", container!="", container!="POD"'
+        f'    namespace="{ns}", pod!="", container!="", container!="POD"'
         f"}}[{days}d:1h])) / 1048576"
     )
 
@@ -195,16 +253,20 @@ def get_prometheus_resource_data(
         cpu_lim_res = f_cpu_lim.result()
         mem_lim_res = f_mem_lim.result()
 
-    data: Dict[str, Dict[str, float]] = {}
+    data: Dict[Tuple[str, str], Dict[str, float]] = {}
 
     def merge_results(results, key):
         if results:
             for item in results:
-                container = item.get("metric", {}).get("container", "")
+                metric = item.get("metric", {})
+                pod = metric.get("pod", "")
+                container = metric.get("container", "")
+                workload = pod_workloads.get(pod)
                 value = float(item.get("value", [0, "0"])[1])
-                if container and value > 0:
+                if workload and container and value > 0:
+                    data_key = (workload, container)
                     data.setdefault(
-                        container,
+                        data_key,
                         {
                             "cpu_req": 0.0,
                             "mem_req": 0.0,
@@ -212,7 +274,8 @@ def get_prometheus_resource_data(
                             "mem_lim": 0.0,
                         },
                     )
-                    data[container][key] = round(value, 6 if "cpu" in key else 1)
+                    rounded = round(value, 6 if "cpu" in key else 1)
+                    data[data_key][key] = max(data[data_key][key], rounded)
 
     merge_results(cpu_req_res, "cpu_req")
     merge_results(mem_req_res, "mem_req")
@@ -220,7 +283,11 @@ def get_prometheus_resource_data(
     merge_results(mem_lim_res, "mem_lim")
 
     if data:
-        log(f"Prometheus 30d: found usage data for {len(data)} containers in {ns}")
+        workload_count = len({workload for workload, _container in data})
+        log(
+            f"Prometheus {days}d: found usage data for {len(data)} workload/container series "
+            f"across {workload_count} workloads in {ns}"
+        )
     else:
         log_warn(f"No Prometheus usage data found for {ns}.")
 
@@ -251,7 +318,7 @@ def get_prom_recommendations(ns: str) -> List[Recommendation]:
 
     prom_url = get_prometheus_url(ns)
     prom_token = get_prometheus_token()
-    prom_data: Dict[str, Dict[str, float]] = {}
+    prom_data: Dict[Tuple[str, str], Dict[str, float]] = {}
     if prom_url and prom_token:
         prom_data = get_prometheus_resource_data(ns, prom_url, prom_token)
 
@@ -270,17 +337,13 @@ def get_prom_recommendations(ns: str) -> List[Recommendation]:
             c_name = None
             for container in containers:
                 c_name_tmp = container.get("name")
-                if c_name_tmp in prom_data:
+                if (name, c_name_tmp) in prom_data:
                     matched_container = container
                     c_name = c_name_tmp
                     break
 
             if not matched_container:
-                if name in prom_data:
-                    matched_container = containers[0]
-                    c_name = name
-                else:
-                    continue
+                continue
 
             resources = matched_container.get("resources", {})
             reqs = resources.get("requests", {})
@@ -300,7 +363,7 @@ def get_prom_recommendations(ns: str) -> List[Recommendation]:
         if not c_name:
             continue
 
-        prom_vals = prom_data.get(c_name, {})
+        prom_vals = prom_data.get((name, c_name), {})
         if not prom_vals:
             continue
 
@@ -411,8 +474,8 @@ def get_prom_recommendations(ns: str) -> List[Recommendation]:
 
 
 def wait_for_rollouts(deployments: List[Tuple[str, str]]):
-    from goldilocks.config import ROLLOUT_TIMEOUT
-    from goldilocks.utils import Spinner, log_warn
+    from resource_updater.config import ROLLOUT_TIMEOUT
+    from resource_updater.utils import Spinner, log_warn
     if not deployments:
         return
     for ns, deploy in deployments:

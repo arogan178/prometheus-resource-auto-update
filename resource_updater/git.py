@@ -2,8 +2,8 @@ import shutil
 from pathlib import Path
 from typing import Optional, Tuple, List
 
-from goldilocks.utils import run_cmd
-from goldilocks.config import (
+from resource_updater.utils import run_cmd
+from resource_updater.config import (
     REPOS_DIR,
     KUSTOMIZE_REPOS_DIR,
     KUSTOMIZE_MONOREPO_NAME,
@@ -11,7 +11,7 @@ from goldilocks.config import (
     UPDATE_COMMIT_MSG,
     REVERT_COMMIT_MSG,
 )
-from goldilocks.bitbucket import repo_remote_url
+from resource_updater.bitbucket import repo_remote_url
 
 
 def get_repo(reponame: str, work_branch: str) -> Tuple[Path, str]:
